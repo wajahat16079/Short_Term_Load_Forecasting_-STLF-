@@ -1,0 +1,437 @@
+---
+title: "Short Term Load Forecasting"
+author: "S Wajahat Ali"
+date: "5/1/2020"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+
+The primary aim of this project is to forecaste hourly load for a day of a house using load data of the house of past year, recorded at a minute interval. Data used in this project can be downloaded from <http://web.lums.edu.pk/~eig/precon.html>.House 26 has been chosen for forecasting.
+
+First, raw data will be cleaned and made ready for analysis. Then trends and other useful information will be extracted through data visulaization. Lastly, different forecating techniques will be used to predict the future values.
+
+Following is the list of all the packages used in this project.
+
+```{r setup, include=FALSE}
+#rm(list = ls())
+library(forecast)
+library(neuralnet)
+library(e1071)
+library(plotly)
+library(reshape)
+library(GGally)
+knitr::opts_chunk$set(echo = TRUE)
+setwd("C:/Users/user/Desktop/STLF")
+
+```
+
+## Preprocessing 
+
+```{r}
+## Read data
+House26 = read.csv("House26.csv")
+## Covert Date_Time column to posixct
+House26$Date_Time = as.POSIXct(House26$Date_Time)
+## Summary of the data
+summary(House26)
+```
+
+
+The first column is the Date_Time, which shows that the data is a time series. The second column is Usage_kW, which represents the total electricity consumption of the household. The values are in kW, which is a unit of power. On average, 1008 W of electricity is consumed in the household. 
+
+
+```{r}
+## structure of the dataset
+str(House26)
+```
+
+The dataset is of year 2019 which was not a leap year, so in 365 days there should be 525600 minutes. The dataset contains 525600 rows as expected. However, we need to look for any duplicate values or  missing values in the dataset. We have to make sure that each time instant has a single row and no time instant is missing. To check this we will create a time series of our own for which we are sure that all rows are correct and then compare it to the dataset to check the integrity of the dataset.  
+
+
+```{r}
+
+## This dataframe contains all minutes between the specified time
+All_minutes = data.frame(Date_Time = seq.POSIXt(
+                      from = as.POSIXct("2018-06-01 00:00:00 PKT"),
+                      to = as.POSIXct("2019-05-31 23:59:00 PKT"), 
+                      by = "min"))
+
+## Merge the two dataframes.
+House26 = merge(House26, All_minutes, by = "Date_Time", all.y = TRUE)
+summary(House26)
+
+```
+
+The summary above shows that no rows have NA in Usage_kW column, which proves that the dataset has all Date and Time instances in the specified time.
+
+The next thing we need to do is to convert the data from minute-interval to hour-interval. The tapply() function has been used to change the granularity of the data. All the minute interval samples in an hour are replaced by a single value, mean of the sixty values. 
+
+```{r, warning=FALSE}
+
+## Using the tapply() function to create hourly data and replace it in House26 dataframe
+House26 = data.frame( Date_Time = seq.POSIXt(
+                          from = as.POSIXct("2018-06-01 PKT"),
+                          to = as.POSIXct("2019-05-31 23:00:00 PKT"),
+                          by = "hour"),
+                          Usage_kW = c(tapply(House26$Usage_kW,
+                          (row(as.matrix(House26$Usage_kW))-1)%/%60, mean)))
+                          
+summary(House26)
+```
+
+The data has been cleaned and is now ready for analysis.
+
+
+
+## Visualizing the Data
+
+The plot below shows that electricity consumption is high for summer months and low for winter months. This means electricity consumption is highly dependent on the weather.
+
+```{r,fig.width = 8}
+ ggplotly(
+  ggplot(House26, aes(x = Date_Time))+
+  geom_line(aes(y = Usage_kW, color = "House 26"))+  
+                labs(x = "Date\\Time", y = "Usage [kW]")
+  )
+```
+
+The following boxplot shows the monthly variation in the electricity consumption.  
+
+```{r}
+House26$Month = paste(months(House26$Date_Time, abbreviate = TRUE) ,
+                       as.POSIXlt(House26$Date_Time)$year+1900)
+
+ggplotly(
+ggplot(House26)+
+  geom_boxplot(aes(x = Month, y = Usage_kW, fill = Month))+
+  labs(x="Month", y = "Usage [kW]")+
+  theme(axis.text.x = element_text(angle = 45))+
+  scale_x_discrete(limits= c(paste(month.abb[6:12], "2018"), 
+                             paste(month.abb[1:5], "2019")))
+)
+
+```
+
+
+
+The boxplot below shows the hourly variation in the electricity consumption. So, apart from seasonal variation electricity consumption also depends on the hour of a day, it is lower between 9 AM to 9 PM compared to 9 PM to 9 AM. 
+
+```{r}
+House26$Hour = as.character.Date(as.numeric(format(House26$Date_Time,'%H')))
+ggplotly(
+ggplot(House26)+
+  geom_boxplot(aes(x = Hour, y = Usage_kW , fill = Hour))+
+  labs(x="Hour", y = "Usage [kW]")+
+  theme(axis.text.x = element_text(angle = 45)))
+```
+
+Removing the unwanted colums and renaming the rest.
+
+```{r}
+House26 = House26[,c(1,2)]
+colnames(House26) = c("Time", "hourly_load")
+
+```
+
+This code creates extra rows for 1st June, 2019, the day we want to forecast for
+
+```{r}
+
+House26 <- rbind(House26,data.frame(Time = rep(NA, 24),
+                                    hourly_load =rep(NA,24)))
+
+House26$Time <- seq.POSIXt(from = as.POSIXct("2018-06-01 00:00:00 PKT"),
+                           to = as.POSIXct("2019-06-01 23:00:00 PKT"),
+                           by = "hour")
+
+```
+
+Creating Hourly, Daily and Weekly lags
+
+```{r}
+House26$Hour_lag = c(rep(NA,1),House26$hourly_load[1:(nrow(House26)-1)])
+House26$Daily_lag = c(rep(NA,24),House26$hourly_load[1:(nrow(House26)-24)])
+House26$Week_lag = c(rep(NA,168),House26$hourly_load[1:(nrow(House26)-168)])
+
+```
+
+There is a high correlation between hourly_load and the rest of the independent variables. Hour_lag has the highest correlation of 0.853 with the hourly_load.
+
+```{r,warning=FALSE,  message=FALSE}
+ggpairs(House26[,-1])
+
+```
+
+Hour_lag has the highest correlation with hourly_load, but we do not have Hour_lag values for the day we want to forecast load for. If we have to use Hour_lag, we will need to forecast for each hour separately and then use that result in forecasting the next hour. This chain forecasting increases the error in our final hour forecast results. So the next in line is Daily_lag, which is the most feasible to be used for STLF in our case. 
+
+
+```{r, warning=FALSE,  message=FALSE}
+ House26_table = House26[(nrow(House26)-23): nrow(House26),]
+  House26_table$Time <- strftime(House26_table$Time, format="%Y-%m-%d %H:%M:%S")
+  House26_table
+
+```
+
+Dividing the Data into two sets. One which we already have hourly load of, and other for  which we need to predict the hourly load.
+```{r}
+House26_Train = House26[1:8760,]
+House26_Predicted = House26[-(1:8760),c(1,4,5)]
+
+```
+
+cleaning data for daily lag and weekly lag separately by removing NAs from the respective datasets.
+```{r}
+House26_Train_Daily_lag = House26_Train[,c(1,2,4)]
+House26_Train_Weekly_lag = House26_Train[,c(1,2,5)]
+##cleaning NAs
+House26_Train_Daily_lag = na.omit(House26_Train_Daily_lag)
+House26_Train_Weekly_lag = na.omit(House26_Train_Weekly_lag)
+```
+
+*Forecasting 1st June 2019 load with Linear Regression, SVM and ANN using both weekly lags and daily lags separately for House 26*
+
+
+# 1. Predicting hourly load using Daily lag and linear regression as forcasting method  
+
+```{r}
+## linear regression 
+
+smp_size = floor(0.80 * nrow(House26_Train_Daily_lag))
+train_ind = sample(seq_len(nrow(House26_Train_Daily_lag)), size = smp_size)
+train_House26 = House26_Train_Daily_lag[train_ind, ]
+test_House26 = House26_Train_Daily_lag[-train_ind, ]
+
+lm_model_Daily_lag_26 = lm(hourly_load~Daily_lag, data = train_House26)
+```
+
+      Calculating accuracy of the model
+
+```{r}
+test_House26$LR_Daily_lag_predicted = predict(lm_model_Daily_lag_26, test_House26)
+accuracy(test_House26$hourly_load, test_House26$LR_Daily_lag_predicted)
+```
+
+      Predicting hourly load for 1st June 2019
+
+```{r}
+House26_Predicted$hourly_load_Predicted_LR_Daily_lag = 
+                                      predict(lm_model_Daily_lag_26,House26_Predicted)
+```
+
+# 2. Predicting hourly load using Daily lag and SVM as forcasting method
+
+```{r}
+
+smp_size = floor(0.80 * nrow(House26_Train_Daily_lag))
+train_ind = sample(seq_len(nrow(House26_Train_Daily_lag)), size = smp_size)
+train_House26 = House26_Train_Daily_lag[train_ind, ]
+test_House26 = House26_Train_Daily_lag[-train_ind, ]
+
+svm_model_Daily_lag_26 = svm(hourly_load~Daily_lag, data = train_House26,
+                             type = "eps-regression", kernel = "radial")
+
+```
+
+      Calculating accuracy of the model
+
+```{r}
+test_House26$svm_Daily_lag_predicted = predict(svm_model_Daily_lag_26, test_House26)
+accuracy(test_House26$hourly_load, test_House26$svm_Daily_lag_predicted)
+```
+
+      Predicting hourly load for 1st June 2019
+
+```{r}
+House26_Predicted$hourly_load_Predicted_svm_Daily_lag = 
+                                predict(svm_model_Daily_lag_26, House26_Predicted)
+```
+
+# 3. Predicting hourly load using Daily lag and ANN as forcasting method
+
+```{r}
+# Scaling the Data
+max = apply(House26_Train_Daily_lag[,-1] , 2 , max)
+min = apply(House26_Train_Daily_lag[,-1], 2 , min)
+scaled = as.data.frame(scale(House26_Train_Daily_lag[,-1], 
+                             center = min, scale = max - min))
+
+# train - test  splitting the data
+smp_size = floor(0.80 * nrow(scaled))
+train_ind = sample(seq_len(nrow(scaled)), size = smp_size)
+train_House26 = scaled[train_ind, ]
+test_House26 = scaled[-train_ind, ]
+ANN_model_Daily_lag_26 = neuralnet(hourly_load~Daily_lag, data = train_House26,
+                       hidden = c(4,8,4), linear.output = TRUE)
+
+```
+
+      Calculating accuracy of the model
+
+```{r}
+scaled_prediction = compute(ANN_model_Daily_lag_26, test_House26[,c(1,2)])
+test_House26$hourly_load_Predicted = (scaled_prediction$net.result *
+                                 (max(House26_Train_Daily_lag$hourly_load, na.rm = T) -
+                                  min(House26_Train_Daily_lag$hourly_load, na.rm = T))) +
+                                  min(House26_Train_Daily_lag$hourly_load, na.rm = T)
+
+test_House26$hourly_load_Actual = (test_House26$hourly_load * 
+                                  (max(House26_Train_Daily_lag$hourly_load, na.rm = T) -
+                                   min(House26_Train_Daily_lag$hourly_load, na.rm = T))) +                                    min(House26_Train_Daily_lag$hourly_load, na.rm = T)
+
+accuracy(test_House26$hourly_load_Actual,test_House26$hourly_load_Predicted )
+
+```
+
+      Predicting hourly load for 1st June 2019
+
+```{r}
+predicted_load = compute(ANN_model_Daily_lag_26, House26_Predicted[,c(1,2)])
+
+House26_Predicted$hourly_load_Predicted_ANN_Daily_lag = (predicted_load$net.result *
+                                 (max(House26_Train_Daily_lag$hourly_load, na.rm = T) -
+                                  min(House26_Train_Daily_lag$hourly_load, na.rm = T))) +
+                                  min(House26_Train_Daily_lag$hourly_load, na.rm = T)
+
+```
+
+
+
+# 4. Predicting hourly load using Weekly lag and linear regression as forcasting method
+
+```{r}
+smp_size <- floor(0.80 * nrow(House26_Train_Weekly_lag))
+train_ind <- sample(seq_len(nrow(House26_Train_Weekly_lag)), size = smp_size)
+train_House26 <- House26_Train_Weekly_lag[train_ind, ]
+test_House26 <- House26_Train_Weekly_lag[-train_ind, ]
+
+lm_model_Weekly_lag_26 = lm(hourly_load~Week_lag, data = train_House26)
+
+```
+
+      Calculating accuracy of the model
+
+```{r}
+test_House26$Weekly_lag_predicted = predict(lm_model_Weekly_lag_26, test_House26)
+accuracy(test_House26$hourly_load, test_House26$Weekly_lag_predicted)
+
+```
+
+      Predicting hourly load for 1st June 2019
+
+```{r}
+House26_Predicted$hourly_load_Predicted_LR_Weekly_lag = 
+                               predict(lm_model_Weekly_lag_26, House26_Predicted)
+```
+
+
+
+# 5. Predicting hourly load using Weekly lag and SVM as forcasting method
+
+```{r}
+smp_size <- floor(0.80 * nrow(House26_Train_Weekly_lag))
+train_ind <- sample(seq_len(nrow(House26_Train_Weekly_lag)), size = smp_size)
+train_House26 <- House26_Train_Weekly_lag[train_ind, ]
+test_House26 <- House26_Train_Weekly_lag[-train_ind, ]
+
+svm_model_Weekly_lag_26 = svm(hourly_load~Week_lag, data = train_House26,
+                             type = "eps-regression", kernel = "radial")
+
+```
+
+      Calculating accuracy of the model
+
+```{r}
+test_House26$svm_Weekly_lag_predicted = predict(svm_model_Weekly_lag_26, test_House26)
+accuracy(test_House26$hourly_load, test_House26$svm_Weekly_lag_predicted)
+```
+
+      Predicting hourly load for 1st June 2019
+
+```{r}
+
+House26_Predicted$hourly_load_Predicted_svm_Weekly_lag = 
+                                predict(svm_model_Weekly_lag_26, House26_Predicted)
+
+```
+
+
+# 6. Predicting hourly load using Weekly lag and ANN as forcasting method
+
+```{r}
+# Scaling the Data
+max = apply(House26_Train_Weekly_lag[,-1] , 2 , max)
+min = apply(House26_Train_Weekly_lag[,-1], 2 , min)
+scaled = as.data.frame(scale(House26_Train_Weekly_lag[,-1], 
+                              center = min, scale = max - min))
+
+# train - test  splitting the data
+smp_size <- floor(0.80 * nrow(scaled))
+train_ind <- sample(seq_len(nrow(scaled)), size = smp_size)
+train_House26 <- scaled[train_ind, ]
+test_House26 <- scaled[-train_ind, ]
+
+
+ANN_model_Weekly_lag_26 = neuralnet(hourly_load~Week_lag, data = train_House26,
+                                   hidden = c(4,8,4), linear.output = TRUE)
+
+```
+
+      Calculating accuracy of the model
+
+```{r}
+scaled_prediction = compute(ANN_model_Weekly_lag_26, test_House26[,c(1,2)])
+
+test_House26$hourly_load_Predicted = (scaled_prediction$net.result *                                                      (max(House26_Train_Weekly_lag$hourly_load, na.rm = T) -
+                                 min(House26_Train_Weekly_lag$hourly_load, na.rm = T))) +
+                                 min(House26_Train_Weekly_lag$hourly_load, na.rm = T)
+
+test_House26$hourly_load_Actual = (test_House26$hourly_load *
+                                 (max(House26_Train_Weekly_lag$hourly_load, na.rm = T) -
+                                  min(House26_Train_Weekly_lag$hourly_load, na.rm = T))) +
+                                  min(House26_Train_Weekly_lag$hourly_load, na.rm = T)
+
+
+accuracy(test_House26$hourly_load_Actual,test_House26$hourly_load_Predicted )
+
+
+```
+
+      Predicting hourly load for 1st June 2019
+      
+```{r}
+
+predicted_load = compute(ANN_model_Weekly_lag_26, House26_Predicted[,c(1,3)])
+House26_Predicted$hourly_load_Predicted_ANN_Weekly_lag = (predicted_load$net.result *
+                                (max(House26_Train_Weekly_lag$hourly_load, na.rm = T) -
+                                 min(House26_Train_Weekly_lag$hourly_load, na.rm = T))) +
+                                 min(House26_Train_Weekly_lag$hourly_load, na.rm = T)
+
+```
+
+# Comparing all six of the models above 
+
+```{r, message=FALSE, warning=FALSE,fig.width = 15}
+
+house26_plot =  melt(House26_Predicted[,-(1:3)])
+house26_plot$Time = House26_Predicted$Time
+ggplot(house26_plot, aes(x = Time))+
+  geom_line(aes(y = value, color = variable))
+
+```
+
+
+
+The analysis of the graph above shows that ANN is not suitable for this forecast.However, Linear Regression and SVM have made a relatively better forecast, both resulted in similar prediction albiet different from those of daily lags in weekly lags.
+
+# Saving the forecasted data to a CSV file.
+
+```{r, message=FALSE, warning=FALSE}
+
+write.csv(House26_Predicted,"C:/Users/user/Desktop/STLF/House26_predicted.csv", row.names = TRUE)
+
+```
+
+
+
